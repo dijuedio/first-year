@@ -18,13 +18,56 @@ const S = {
   day: 1, time: '06:40',
   money: 8000, trust: 50, alert: 50, blackout: 0, kept: 0, flags: [],
   msgs: {}, unread: {}, calls: [], sms: [], notes: [], ledger: [], log: [],
-  view: 'home', chatWith: null, filter: '全部', tab: 'wx', seq: 0, toast: null
+  view: 'home', chatWith: null, filter: '全部', tab: 'wx', seq: 0, toast: null,
+  profile: null, edit: '', draft: '', login: null
 };
 
 const groups = () => (S.story ? S.story.groups : ['家人']);
 const contact = (id) => (S.story.contacts.find((c) => c.id === id) || { id, name: id, group: '陌生人', avatar: '?', color: '#666', note: '' });
 const unreadAll = () => Object.values(S.unread).reduce((a, b) => a + b, 0);
 const DAY0 = new Date(2026, 8, 1); // 9 月 1 日落地
+
+/* ------------------------------------------------ 玩家档案（名字 / 头像） */
+const AVS = [
+  { e: '🌱', bg: 'linear-gradient(135deg,#8fd0ac,#4c9a78)' },
+  { e: '☕', bg: 'linear-gradient(135deg,#d4b08a,#9c6f4a)' },
+  { e: '🌙', bg: 'linear-gradient(135deg,#9b9cc8,#5a5b8f)' },
+  { e: '🐟', bg: 'linear-gradient(135deg,#8fc4dc,#3f7fa8)' },
+  { e: '🍊', bg: 'linear-gradient(135deg,#f0bb85,#cf7a3a)' },
+  { e: '📚', bg: 'linear-gradient(135deg,#b8aede,#7a6bb0)' },
+  { e: '🌊', bg: 'linear-gradient(135deg,#87c8de,#3f8aa8)' },
+  { e: '🍃', bg: 'linear-gradient(135deg,#b2cf93,#6f9a4e)' }
+];
+const PROFILE_KEY = 'firstyear.profile';
+
+function loadProfile() {
+  try {
+    const p = JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null');
+    if (p && typeof p.name === 'string') return { name: p.name, av: p.av | 0, img: p.img || '' };
+  } catch (e) {}
+  return null;
+}
+function saveProfile(p) {
+  S.profile = p;
+  try { localStorage.setItem(PROFILE_KEY, JSON.stringify(p)); } catch (e) {}
+}
+function meName() { return (S.profile && S.profile.name) || '我'; }
+
+function meAvatar(size) {
+  const p = S.profile || { av: 0, img: '' };
+  if (p.img) {
+    return `<span class="avatar avimg" style="width:${size}px;height:${size}px;background-image:url('${p.img}')"></span>`;
+  }
+  const a = AVS[(p.av | 0) % AVS.length];
+  return `<span class="avatar" style="width:${size}px;height:${size}px;background:${a.bg};font-size:${Math.round(size * 0.48)}px">${a.e}</span>`;
+}
+
+function avGridHtml(p) {
+  const cur = p || { av: 0, img: '' };
+  return AVS.map((a, i) =>
+    `<button class="avPick ${cur.img ? '' : (i === (cur.av | 0) ? 'on' : '')}" data-av="${i}" style="background:${a.bg}">${a.e}</button>`
+  ).join('') + `<label class="avPick upch" title="上传图片">＋<input type="file" data-avfile="1" accept="image/*" hidden></label>`;
+}
 
 function dateOf(day) {
   const d = new Date(DAY0.getTime() + (day - 1) * 86400000);
@@ -45,7 +88,8 @@ async function boot() {
     return;
   }
   S.steps = S.story.order || [];
-  splash();
+  S.profile = loadProfile();
+  if (S.profile) splash(); else loginScreen();
 }
 
 function startGame() {
@@ -84,7 +128,7 @@ function render() {
   else if (S.view === 'settings') html = viewSettings();
   app.innerHTML = html;
   if (S.toast && S.view !== 'chat') app.insertAdjacentHTML('beforeend', toastHtml());
-  if (S.view !== 'home' && !S.over && S.hint) app.insertAdjacentHTML('beforeend', '<div class="barhint">点下面这条横线回桌面</div>');
+  if (S.profile && S.view !== 'home' && S.view !== 'login' && S.view !== 'splash' && !S.over && S.hint) app.insertAdjacentHTML('beforeend', '<div class="barhint">点下面这条横线回桌面</div>');
   // 聊天页滚到底
   const m = app.querySelector('.msgs');
   if (m) m.scrollTop = m.scrollHeight;
@@ -110,7 +154,7 @@ function bind() {
   if (hb) {
     hb.style.cursor = 'pointer';
     hb.onclick = () => {
-      if (S.over) return;
+      if (S.over || S.view === 'login' || S.view === 'splash') return;
       S.hint = false;
       S.toast = null;
       S.view = 'home';
@@ -161,7 +205,84 @@ function bind() {
     tin.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); sendTyped(); }
     });
+    tin.addEventListener('input', () => { S.draft = tin.value; });
+    // 发完一句不用再点输入框：每轮渲染后自动把光标放回去
+    if (!S.busy && S.replyStage === 'act' && document.activeElement !== tin) {
+      tin.focus();
+      const n = tin.value.length;
+      try { tin.setSelectionRange(n, n); } catch (e) {}
+    }
   }
+  const lgName = document.querySelector('#lgName');
+  if (lgName) {
+    lgName.addEventListener('input', () => { S.login.name = lgName.value; });
+    if (document.activeElement !== lgName) { lgName.focus(); }
+  }
+  document.querySelectorAll('[data-av]').forEach((b) => {
+    b.onclick = () => {
+      const p = (S.view === 'login') ? S.login : (S.profile || { name: meName(), av: 0, img: '' });
+      p.av = parseInt(b.dataset.av, 10) || 0;
+      p.img = '';
+      if (S.view === 'login') {
+        document.querySelectorAll('#lgGrid .avPick').forEach((x) => x.classList.remove('on'));
+        b.classList.add('on');
+        $('#lgPreview').innerHTML = meAvatarOf(p, 62);
+      } else {
+        saveProfile({ name: meName(), av: p.av, img: '' });
+        S.edit = '';
+        render();
+      }
+    };
+  });
+  document.querySelectorAll('[data-avfile]').forEach((inp) => {
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      if (f.size > 900 * 1024) { alert('图片太大了，换一张小于 900KB 的'); return; }
+      const fr = new FileReader();
+      fr.onload = () => {
+        const p = (S.view === 'login') ? S.login : (S.profile || { name: meName(), av: 0, img: '' });
+        p.img = String(fr.result);
+        if (S.view === 'login') {
+          document.querySelectorAll('#lgGrid .avPick').forEach((x) => x.classList.remove('on'));
+          $('#lgPreview').innerHTML = meAvatarOf(p, 62);
+        } else {
+          saveProfile({ name: meName(), av: p.av | 0, img: p.img });
+          S.edit = '';
+          render();
+        }
+      };
+      fr.readAsDataURL(f);
+    };
+  });
+  document.querySelectorAll('[data-login]').forEach((b) => {
+    b.onclick = () => {
+      const p = S.login || { name: '', av: 0, img: '' };
+      const nm = (p.name || '').trim() || '无名的人';
+      saveProfile({ name: nm.slice(0, 8), av: p.av | 0, img: p.img || '' });
+      S.login = null;
+      splash();
+    };
+  });
+  document.querySelectorAll('[data-save-name]').forEach((b) => {
+    b.onclick = () => {
+      const v = (document.querySelector('#editName') || {}).value || '';
+      const nm = v.trim().slice(0, 8);
+      if (!nm) { alert('名字总得有一个'); return; }
+      saveProfile({ name: nm, av: (S.profile || {}).av | 0, img: (S.profile || {}).img || '' });
+      S.edit = '';
+      render();
+    };
+  });
+  document.querySelectorAll('[data-edit]').forEach((b) => {
+    b.onclick = () => { S.edit = (b.dataset.edit === 'close') ? '' : b.dataset.edit; render(); };
+  });
+  document.querySelectorAll('[data-logout]').forEach((b) => {
+    b.onclick = () => {
+      try { localStorage.removeItem(PROFILE_KEY); } catch (e) {}
+      location.reload();
+    };
+  });
   document.querySelectorAll('[data-answer]').forEach((b) => {
     b.onclick = () => answerCall();
   });
@@ -201,17 +322,54 @@ function viewHome() {
   </div>`;
 }
 
+function loginScreen() {
+  S.view = 'login';
+  const cur = S.login || S.profile || { name: '', av: 0, img: '' };
+  S.login = cur;
+  $('#screen').classList.add('dark');
+  $('#app').innerHTML = `
+  <div class="home login">
+    <div class="lgTop">
+      <div class="lgSub">九 十 天</div>
+      <h1>第一年</h1>
+      <p>先给自己留个名字。<br>往后这一年，别人叫你的时候，用的就是它。</p>
+    </div>
+    <div class="lgCard">
+      <div class="lgAv" id="lgPreview">${meAvatarOf(cur, 62)}</div>
+      <input id="lgName" class="lgin" maxlength="8" autocomplete="off"
+             placeholder="给自己起个名字" value="${esc(cur.name)}">
+      <div class="avGrid" id="lgGrid">${avGridHtml(cur)}</div>
+      <button class="rep go" data-login="1" style="width:100%;margin-top:12px;padding:12px 0">进入这座城</button>
+    </div>
+    <p class="lgFoot">人物与事件均为虚构</p>
+  </div>`;
+  bind();
+}
+
 function splash() {
+  S.view = 'splash';
   $('#screen').classList.add('dark');
   $('#app').innerHTML = `
   <div class="home" style="justify-content:center;align-items:center;text-align:center;padding:0 30px">
     <div style="font-size:13px;letter-spacing:6px;color:#7d99a8">九 十 天</div>
     <h1 style="font-size:40px;font-weight:200;letter-spacing:6px;margin:16px 0 8px">第一年</h1>
     <p style="font-size:12.5px;color:#8fa3ae;line-height:2;margin:0">一座城，八千块。<br>这一年发生的事，都在手机里。</p>
-    <button class="rep go" data-start="1" style="margin-top:26px;padding:11px 30px">开始</button>
-    <p style="font-size:11px;color:#5f707a;margin-top:34px">人物与事件均为虚构</p>
+    <div style="margin-top:26px;display:flex;align-items:center;gap:10px;justify-content:center">
+      ${meAvatar(30)}
+      <span style="font-size:13px;color:#9fb3bd">以「${esc(meName())}」的身份</span>
+    </div>
+    <button class="rep go" data-start="1" style="margin-top:20px;padding:11px 30px">开始</button>
+    <p style="font-size:11px;color:#5f707a;margin-top:30px">人物与事件均为虚构</p>
+    <p style="font-size:11px;color:#4a5a63;margin-top:14px"><span data-logout="1" style="cursor:pointer;text-decoration:underline">换个身份</span></p>
   </div>`;
   bind();
+}
+
+/* 登录页预览头像（用临时档案，不写 S.profile） */
+function meAvatarOf(p, size) {
+  if (p.img) return `<span class="avatar avimg" style="width:${size}px;height:${size}px;background-image:url('${p.img}')"></span>`;
+  const a = AVS[(p.av | 0) % AVS.length];
+  return `<span class="avatar" style="width:${size}px;height:${size}px;background:${a.bg};font-size:${Math.round(size * 0.48)}px">${a.e}</span>`;
 }
 
 /* ------------------------------------------------ 微信 */
@@ -291,12 +449,28 @@ function viewMe() {
     <div class="nav">我</div>
     <div class="app" style="padding-top:6px">
       <div class="card" style="display:flex;gap:13px;align-items:center">
-        <span class="avatar" style="width:52px;height:52px;background:#3a4a5c">我</span>
-        <div>
-          <div style="font-size:17px">二十二岁 · 刚毕业</div>
-          <div class="muted">第 ${S.day} 天 · ${dateOf(S.day)}</div>
+        ${meAvatar(52)}
+        <div style="flex:1">
+          <div style="font-size:17px">${esc(meName())}</div>
+          <div class="muted">二十二岁 · 刚毕业 · 第 ${S.day} 天</div>
         </div>
+        <button class="mini" data-edit="name">改</button>
       </div>
+      ${S.edit === 'name' ? `
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">改个名字，最多八个字</div>
+        <input id="editName" class="lgin" maxlength="8" autocomplete="off" value="${esc(meName())}">
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="rep go" data-save-name="1">保存</button>
+          <button class="rep" data-edit="close">算了</button>
+        </div>
+      </div>` : ''}
+      ${S.edit === 'av' ? `
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">换张头像，也可以传自己的图</div>
+        <div class="avGrid" id="meGrid">${avGridHtml(S.profile)}</div>
+        <div style="margin-top:10px"><button class="rep" data-edit="close">收起</button></div>
+      </div>` : ''}
       <div class="card">
         <div class="row"><span class="k">身上还有</span><span class="v">¥ ${S.money.toLocaleString('zh-CN')}</span></div>
         <div class="row"><span class="k">警惕</span><span class="v">${pct(S.alert)}</span></div>
@@ -309,6 +483,11 @@ function viewMe() {
       <div class="card">
         <div class="row"><span class="k">记下来的话</span><span class="v">${S.kept} 句</span></div>
         <div class="row"><span class="k">走过的天</span><span class="v">${S.day} / 90</span></div>
+      </div>
+      <div class="card">
+        <button class="rowbtn" data-edit="name"><span class="k">名字</span><span class="v">${esc(meName())} ›</span></button>
+        <button class="rowbtn" data-edit="av"><span class="k">头像</span><span class="v">换一张 ›</span></button>
+        <button class="rowbtn" data-logout="1"><span class="k">退出登录</span><span class="v">›</span></button>
       </div>
     </div>
     ${tabbar()}
@@ -333,7 +512,7 @@ function viewChat() {
     if (m.who === 'typing') return `<div class="typing"><span class="avatar" style="background:${c.color}">${esc(c.avatar)}</span><span class="dots"><span></span><span></span><span></span></span></div>`;
     const cls = m.who === 'me' ? 'me' : '';
     return `<div class="msg ${cls} ${m.fresh ? 'new' : ''}">
-      <span class="avatar" style="background:${m.who === 'me' ? '#3a4a5c' : c.color}">${m.who === 'me' ? '我' : esc(c.avatar)}</span>
+      ${m.who === 'me' ? meAvatar(34) : `<span class="avatar" style="background:${c.color}">${esc(c.avatar)}</span>`}
       <div class="bub">${esc(m.text)}</div>
     </div>`;
   }).join('');
@@ -362,7 +541,7 @@ function viewChat() {
     <div class="msgs">${bubbles || '<div class="empty">还没有消息</div>'}</div>
     ${replies}
     <div class="inputbar">
-      <input id="typin" class="realin" autocomplete="off"
+      <input id="typin" class="realin" autocomplete="off" value="${esc(S.draft || '')}"
              placeholder="${replies ? '点上面的句子，或者自己打字' : '自己打字也可以'}">
       <button class="sendbtn" data-send="1">发送</button>
     </div>
@@ -371,6 +550,7 @@ function viewChat() {
 
 function openChat(id) {
   S.chatWith = id;
+  S.draft = '';
   S.unread[id] = 0;
   S.toast = null;
   S.view = 'chat';
@@ -620,9 +800,10 @@ async function rejectCall() {
 function sendTyped() {
   const inp = document.querySelector('#typin');
   if (!inp || S.busy || S.replyStage !== 'act') return;
-  const v = inp.value.trim();
+  const v = (inp.value || S.draft || '').trim();
   if (!v) return;
   inp.value = '';
+  S.draft = '';
   choose(v, true);
 }
 
