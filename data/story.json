@@ -1,0 +1,91 @@
+{
+  "contacts": [
+    { "id": "mom", "name": "妈", "group": "家人", "avatar": "妈", "color": "#b8543f", "note": "一周一个电话，总说家里都好", "kind": "chat" },
+    { "id": "zhe", "name": "阿哲", "group": "朋友", "avatar": "哲", "color": "#6d4f7a", "note": "同乡，比你早来两年", "kind": "chat" },
+    { "id": "wang", "name": "王主管", "group": "工作", "avatar": "王", "color": "#3e5a78", "note": "一家小公司的老板，面试时说的都是以后", "kind": "chat" },
+    { "id": "chen", "name": "陈姐", "group": "房东·中介", "avatar": "陈", "color": "#2f6b52", "note": "房产中介，带你看了三套房，说话很快", "kind": "chat" },
+    { "id": "zhou", "name": "老周", "group": "房东·中介", "avatar": "周", "color": "#6b5535", "note": "二房东，房子是他的，合同也是他的", "kind": "chat" },
+    { "id": "kefu", "name": "400-6351", "group": "陌生人", "avatar": "?", "color": "#4a4a4a", "note": "没存过的号码，说是平台客服", "kind": "call" },
+    { "id": "credit", "name": "未知号码", "group": "陌生人", "avatar": "?", "color": "#4a4a4a", "note": "打来就说是征信中心", "kind": "call" },
+    { "id": "ahao", "name": "阿豪", "group": "陌生人", "avatar": "豪", "color": "#4a4a4a", "note": "招工的，头像是辆很亮的新车", "kind": "chat" },
+    { "id": "moving", "name": "李师傅", "group": "陌生人", "avatar": "李", "color": "#575757", "note": "搬家时平台派的师傅", "kind": "call" }
+  ],
+  "groups": ["家人", "朋友", "工作", "房东·中介", "陌生人"],
+  "order": [
+    {
+      "day": 1, "time": "06:40", "event": "mom_arrive", "contact": "mom",
+      "bridge": "火车到站是早上六点。你在出站口站了一会儿，才想起来该给家里报个平安。"
+    },
+    {
+      "day": 6, "time": "10:12", "event": "rent_agent", "contact": "chen",
+      "bridge": "妈说别省那点中介费。你在网上留了个电话，第二天就有人加你。"
+    },
+    {
+      "day": 9, "time": "15:30", "event": "rent_owner", "contact": "zhou",
+      "bridge": "陈姐那套要押一付三，你算了一晚上。群里有人发了个自己带看的房东。"
+    },
+    {
+      "day": 12, "time": "19:05", "event": "contract", "contact": "zhou",
+      "bridge": "你选了老周那套，月租便宜两百。今天他说合同得在手机上签。"
+    },
+    {
+      "day": 18, "time": "09:20", "event": "job_small", "contact": "wang",
+      "bridge": "房子的事定下来了，你开始投简历。回你最快的是这家小公司。"
+    },
+    {
+      "day": 24, "time": "16:48", "event": "kefu", "contact": "kefu",
+      "bridge": "这几天你在好几个租房、招聘网站上留过手机号。",
+      "bridge_if": {
+        "loan_signed": "签合同那天，你把身份证和银行卡都拍了照发给老周。",
+        "money_low": "月底快到了，你在几个平台上比过房租和贷款。"
+      }
+    },
+    {
+      "day": 30, "time": "11:00", "event": "job_dispatch", "contact": "wang",
+      "bridge": "王主管说你不用去上试岗了，另外给你找了个活。"
+    },
+    {
+      "day": 38, "time": "20:15", "event": "mom_money", "contact": "mom",
+      "bridge": "这个点妈打电话过来，一般是有事。"
+    },
+    {
+      "day": 46, "time": "18:30", "event": "laoxiang", "contact": "zhe",
+      "bridge": "阿哲在群里 @ 你，说一起吃个饭，他请。"
+    },
+    {
+      "day": 54, "time": "14:02", "event": "credit", "contact": "credit",
+      "bridge": "你在手机上搜过一次「征信花了怎么办」。",
+      "bridge_if": {
+        "loan_signed": "那份分期这周上了征信，你收到一条提醒短信。"
+      }
+    },
+    {
+      "day": 62, "time": "22:10", "event": "overseas", "contact": "ahao",
+      "bridge": "卡里只剩三位数。这时候有人加你微信，头像是辆很亮的新车。"
+    },
+    {
+      "day": 70, "time": "21:00", "event": "mom_home", "contact": "mom",
+      "bridge": "腊月了。妈先发来一张家里的照片，然后打了过来。"
+    },
+    {
+      "day": 76, "time": "08:30", "event": "moving", "contact": "moving",
+      "bridge": "你决定搬到更远的地方，房租便宜八百。约好的师傅早上八点到了楼下。"
+    },
+    {
+      "day": 80, "time": "10:20", "event": "checkout", "contact": "zhou",
+      "bridge": "东西搬空了。老周拿着手电，一层一层看。"
+    },
+    {
+      "day": 86, "time": "17:40", "event": "help_agent", "contact": "chen",
+      "bridge": "退完租出来，你又路过那家中介门店。陈姐在门口抽烟。"
+    }
+  ],
+  "sms": [
+    { "from": "95588", "title": "工商银行", "text": "您尾号 3847 的账户存入 8,000.00 元，余额 8,000.00 元。" }
+  ],
+  "notes": [
+    "找住处（预算 1700 以内，别要押一付三）",
+    "办张本地的电话卡",
+    "简历再改一遍"
+  ]
+}
