@@ -357,3 +357,11 @@ body{
 .rowbtn .v{color:#8a8a8a;font-size:13px}
 .rowbtn:hover .v{color:#069c4c}
 .avimg{background-size:cover;background-position:center;display:inline-block}
+
+/* ---------- 登录 / 注册 ---------- */
+.authTabs{display:flex;gap:6px;margin:0 0 12px;background:rgba(255,255,255,.06);border-radius:10px;padding:4px}
+.authTabs button{flex:1;border:0;background:none;color:#8fa3ae;font-size:13.5px;padding:8px 0;border-radius:8px;cursor:pointer}
+.authTabs button.on{background:rgba(255,255,255,.14);color:#fff}
+.lgCard .lgin + .lgin{margin-top:9px}
+.authMsg{min-height:16px;font-size:11.5px;color:#e08585;margin:9px 0 0;text-align:center}
+.uname{font-size:11.5px;color:#b0b0b0;margin-top:2px}

@@ -282,6 +282,109 @@ ENDINGS = {
 }
 
 
+
+# ---------------------------------------------------------------- 账号（SQLite，标准库）
+
+import hashlib
+import secrets
+import sqlite3
+import time
+
+DB_PATH = os.path.join(DATA_DIR, "users.db")
+PW_ITER = 120000          # PBKDF2 迭代次数
+SESSION_DAYS = 30
+NICK_MAX = 8
+IMG_MAX = 1200 * 1024     # 头像 dataURL 上限，约 900KB 原图
+
+
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    with db_conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                username    TEXT UNIQUE NOT NULL,
+                pass_hash   TEXT NOT NULL,
+                salt        TEXT NOT NULL,
+                nickname    TEXT NOT NULL DEFAULT '',
+                avatar      INTEGER NOT NULL DEFAULT 0,
+                avatar_img  TEXT NOT NULL DEFAULT '',
+                created_at  INTEGER NOT NULL
+            )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sessions(
+                token       TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                created_at  INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL
+            )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+
+
+def hash_password(password, salt_hex=None):
+    salt_hex = salt_hex or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), PW_ITER)
+    return digest.hex(), salt_hex
+
+
+def verify_password(password, salt_hex, expected):
+    digest, _ = hash_password(password, salt_hex)
+    return secrets.compare_digest(digest, expected)
+
+
+def public_user(row):
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "nickname": row["nickname"],
+        "avatar": row["avatar"],
+        "avatar_img": row["avatar_img"],
+        "created_at": row["created_at"],
+    }
+
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    with db_conn() as c:
+        c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+        c.execute(
+            "INSERT INTO sessions(token, user_id, created_at, expires_at) VALUES(?,?,?,?)",
+            (token, user_id, now, now + SESSION_DAYS * 86400),
+        )
+    return token
+
+
+def user_from_token(token):
+    if not token:
+        return None
+    now = int(time.time())
+    conn = db_conn()
+    try:
+        row = conn.execute(
+            "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id "
+            "WHERE s.token = ? AND s.expires_at > ?", (token, now)).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+def drop_session(token):
+    if not token:
+        return
+    with db_conn() as c:
+        c.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+
+init_db()
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -299,6 +402,12 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
+    def _token(self):
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return ""
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/":
@@ -308,6 +417,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(os.path.join(STATIC_DIR, rel))
         if path == "/api/meta":
             return self._json({"meta": EVENTS["meta"], "events": EVENTS["events"], "story": STORY})
+        if path == "/api/me":
+            row = user_from_token(self._token())
+            if not row:
+                return self._json({"error": "没有登录"}, 401)
+            return self._json({"user": public_user(row)})
         return self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def _file(self, full):
@@ -325,6 +439,63 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "bad json"}, 400)
 
         path = self.path.split("?")[0]
+
+        if path in ("/api/register", "/api/login"):
+            username = (payload.get("username") or "").strip()
+            password = payload.get("password") or ""
+            if not (3 <= len(username) <= 20):
+                return self._json({"error": "用户名要 3 到 20 个字"}, 400)
+            if len(password) < 6:
+                return self._json({"error": "密码至少 6 位"}, 400)
+            reg = path == "/api/register"
+            conn = db_conn()
+            try:
+                row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+                if reg:
+                    if row:
+                        return self._json({"error": "这个用户名已经有人用了"}, 409)
+                    ph, salt = hash_password(password)
+                    cur = conn.execute(
+                        "INSERT INTO users(username, pass_hash, salt, created_at) VALUES(?,?,?,?)",
+                        (username, ph, salt, int(time.time())))
+                    conn.commit()
+                    uid = cur.lastrowid
+                else:
+                    if not row or not verify_password(password, row["salt"], row["pass_hash"]):
+                        return self._json({"error": "用户名或密码不对"}, 401)
+                    uid = row["id"]
+                token = create_session(uid)
+                fresh = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+                return self._json({"token": token, "user": public_user(fresh)}, 201 if reg else 200)
+            finally:
+                conn.close()
+
+        if path == "/api/logout":
+            drop_session(self._token())
+            return self._json({"ok": True})
+
+        if path == "/api/profile":
+            row = user_from_token(self._token())
+            if not row:
+                return self._json({"error": "没有登录"}, 401)
+            nickname = (payload.get("nickname") or "").strip()[:NICK_MAX]
+            avatar = payload.get("avatar")
+            avatar = int(avatar) if isinstance(avatar, int) or str(avatar).isdigit() else 0
+            avatar = max(0, min(7, avatar))
+            img = payload.get("avatar_img") or ""
+            if len(img) > IMG_MAX:
+                return self._json({"error": "头像图片太大了"}, 413)
+            if not nickname:
+                return self._json({"error": "名字不能是空的"}, 400)
+            with db_conn() as c:
+                c.execute("UPDATE users SET nickname = ?, avatar = ?, avatar_img = ? WHERE id = ?",
+                          (nickname, avatar, img, row["id"]))
+            conn = db_conn()
+            try:
+                fresh = conn.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+            finally:
+                conn.close()
+            return self._json({"user": public_user(fresh)})
 
         if path == "/api/talk":
             ev = EVENT_MAP.get(payload.get("event_id"))

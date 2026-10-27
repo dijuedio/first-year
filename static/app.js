@@ -19,7 +19,8 @@ const S = {
   money: 8000, trust: 50, alert: 50, blackout: 0, kept: 0, flags: [],
   msgs: {}, unread: {}, calls: [], sms: [], notes: [], ledger: [], log: [],
   view: 'home', chatWith: null, filter: '全部', tab: 'wx', seq: 0, toast: null,
-  profile: null, edit: '', draft: '', login: null
+  profile: null, edit: '', draft: '', login: null,
+  user: null, authMode: 'login', authName: '', authMsg: ''
 };
 
 const groups = () => (S.story ? S.story.groups : ['家人']);
@@ -39,6 +40,38 @@ const AVS = [
   { e: '🍃', bg: 'linear-gradient(135deg,#b2cf93,#6f9a4e)' }
 ];
 const PROFILE_KEY = 'firstyear.profile';
+const AUTH_KEY = 'firstyear.token';
+
+const authToken = () => {
+  try { return localStorage.getItem(AUTH_KEY) || ''; } catch (e) { return ''; }
+};
+function setAuthToken(t) {
+  try { if (t) localStorage.setItem(AUTH_KEY, t); else localStorage.removeItem(AUTH_KEY); } catch (e) {}
+}
+async function api(path, body, method) {
+  const opt = { method: method || (body ? 'POST' : 'GET'), headers: {} };
+  if (body) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const t = authToken();
+  if (t) opt.headers['Authorization'] = 'Bearer ' + t;
+  try {
+    const r = await fetch(path, opt);
+    let d = {};
+    try { d = await r.json(); } catch (e) {}
+    return { ok: r.ok, status: r.status, data: d };
+  } catch (e) {
+    return { ok: false, status: 0, data: { error: '连不上本地服务' } };
+  }
+}
+function applyUser(u) {
+  saveProfile({ name: u.nickname || u.username, av: u.avatar | 0, img: u.avatar_img || '' });
+  S.user = { username: u.username, nickname: u.nickname, id: u.id };
+}
+async function pushProfile() {
+  if (!authToken()) return;
+  const p = S.profile || { name: '', av: 0, img: '' };
+  const r = await api('/api/profile', { nickname: p.name, avatar: p.av | 0, avatar_img: p.img || '' });
+  if (r.ok && r.data.user) S.user = { username: r.data.user.username, nickname: r.data.user.nickname, id: r.data.user.id };
+}
 
 function loadProfile() {
   try {
@@ -89,7 +122,16 @@ async function boot() {
   }
   S.steps = S.story.order || [];
   S.profile = loadProfile();
-  if (S.profile) splash(); else loginScreen();
+  if (authToken()) {
+    const r = await api('/api/me');
+    if (r.ok && r.data.user) {
+      applyUser(r.data.user);
+      if (r.data.user.nickname) return splash();
+      return profileScreen();
+    }
+    setAuthToken('');
+  }
+  authScreen('login');
 }
 
 function startGame() {
@@ -114,6 +156,8 @@ function setStatus() {
 }
 
 function render() {
+  // 登录页和启动页由 authScreen()/splash() 自己画，别让残留的定时器把它们刷白
+  if (S.view === 'login' || S.view === 'splash') return;
   setStatus();
   const app = $('#app');
   let html = '';
@@ -231,6 +275,7 @@ function bind() {
         saveProfile({ name: meName(), av: p.av, img: '' });
         S.edit = '';
         render();
+        pushProfile();
       }
     };
   });
@@ -250,17 +295,19 @@ function bind() {
           saveProfile({ name: meName(), av: p.av | 0, img: p.img });
           S.edit = '';
           render();
+          pushProfile();
         }
       };
       fr.readAsDataURL(f);
     };
   });
   document.querySelectorAll('[data-login]').forEach((b) => {
-    b.onclick = () => {
+    b.onclick = async () => {
       const p = S.login || { name: '', av: 0, img: '' };
       const nm = (p.name || '').trim() || '无名的人';
       saveProfile({ name: nm.slice(0, 8), av: p.av | 0, img: p.img || '' });
       S.login = null;
+      await pushProfile();
       splash();
     };
   });
@@ -272,16 +319,37 @@ function bind() {
       saveProfile({ name: nm, av: (S.profile || {}).av | 0, img: (S.profile || {}).img || '' });
       S.edit = '';
       render();
+      pushProfile();
     };
   });
   document.querySelectorAll('[data-edit]').forEach((b) => {
     b.onclick = () => { S.edit = (b.dataset.edit === 'close') ? '' : b.dataset.edit; render(); };
   });
   document.querySelectorAll('[data-logout]').forEach((b) => {
-    b.onclick = () => {
+    b.onclick = async () => {
+      await api('/api/logout', {}, 'POST');
+      setAuthToken('');
+      S.user = null;
+      S.profile = null;
+      S.login = null;
       try { localStorage.removeItem(PROFILE_KEY); } catch (e) {}
-      location.reload();
+      authScreen('login');
     };
+  });
+  document.querySelectorAll('[data-mode]').forEach((b) => {
+    b.onclick = () => {
+      const nm = (document.querySelector('#auName') || {}).value || '';
+      S.authName = nm.trim();
+      authScreen(b.dataset.mode);
+    };
+  });
+  document.querySelectorAll('[data-submit]').forEach((b) => {
+    b.onclick = () => submitAuth();
+  });
+  document.querySelectorAll('#auName, #auPass, #auPass2').forEach((inp) => {
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submitAuth(); }
+    });
   });
   document.querySelectorAll('[data-answer]').forEach((b) => {
     b.onclick = () => answerCall();
@@ -322,7 +390,40 @@ function viewHome() {
   </div>`;
 }
 
-function loginScreen() {
+function authScreen(mode) {
+  S.view = 'login';
+  S.authMode = mode || 'login';
+  S.authMsg = '';
+  const reg = S.authMode === 'register';
+  $('#screen').classList.add('dark');
+  $('#app').innerHTML = `
+  <div class="home login">
+    <div class="lgTop">
+      <div class="lgSub">九 十 天</div>
+      <h1>第一年</h1>
+      <p>一座城，八千块。<br>这一年发生的事，都在手机里。</p>
+    </div>
+    <div class="lgCard">
+      <div class="authTabs">
+        <button class="${reg ? '' : 'on'}" data-mode="login">登录</button>
+        <button class="${reg ? 'on' : ''}" data-mode="register">注册</button>
+      </div>
+      <input id="auName" class="lgin" maxlength="20" autocomplete="username"
+             placeholder="用户名（3 到 20 个字）" value="${esc(S.authName || '')}">
+      <input id="auPass" class="lgin" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}"
+             placeholder="密码（至少 6 位）">
+      ${reg ? `<input id="auPass2" class="lgin" type="password" autocomplete="new-password" placeholder="再输一次密码">` : ''}
+      <div class="authMsg" id="auMsg"></div>
+      <button class="rep go" data-submit="1" style="width:100%;margin-top:4px;padding:12px 0">${reg ? '注册并进入' : '登录'}</button>
+    </div>
+    <p class="lgFoot">账号存在这台电脑的 data/users.db 里</p>
+  </div>`;
+  bind();
+  const n = document.querySelector('#auName');
+  if (n) n.focus();
+}
+
+function profileScreen() {
   S.view = 'login';
   const cur = S.login || S.profile || { name: '', av: 0, img: '' };
   S.login = cur;
@@ -344,6 +445,31 @@ function loginScreen() {
     <p class="lgFoot">人物与事件均为虚构</p>
   </div>`;
   bind();
+}
+
+async function submitAuth() {
+  const val = (sel) => (document.querySelector(sel) || {}).value || '';
+  const reg = S.authMode === 'register';
+  const username = val('#auName').trim();
+  const password = val('#auPass');
+  const again = val('#auPass2');
+  const tip = (t) => {
+    S.authMsg = t;
+    const m = document.querySelector('#auMsg');
+    if (m) m.textContent = t;
+  };
+  S.authName = username;
+  if (!username || password.length < 6) return tip('用户名要填，密码至少 6 位');
+  if (reg && again !== password) return tip('两次输入不一样');
+  tip(reg ? '正在注册…' : '正在登录…');
+  const r = await api(reg ? '/api/register' : '/api/login', { username, password });
+  if (!r.ok) return tip(r.data.error || '出了点问题，再试一次');
+  setAuthToken(r.data.token);
+  applyUser(r.data.user);
+  S.authMsg = '';
+  S.authName = '';
+  if (r.data.user.nickname) return splash();
+  return profileScreen();
 }
 
 function splash() {
@@ -453,6 +579,7 @@ function viewMe() {
         <div style="flex:1">
           <div style="font-size:17px">${esc(meName())}</div>
           <div class="muted">二十二岁 · 刚毕业 · 第 ${S.day} 天</div>
+          <div class="uname">@${esc((S.user && S.user.username) || '')}</div>
         </div>
         <button class="mini" data-edit="name">改</button>
       </div>
@@ -648,6 +775,7 @@ function lastEventFor(cid) {
 }
 
 async function nextStep() {
+  if (S.view === 'login' || S.view === 'splash') return;
   S.idx++;
   if (S.idx >= S.steps.length) return finish();
   const step = S.steps[S.idx];
