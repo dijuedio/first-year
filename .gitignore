@@ -17,3 +17,7 @@ data/.keysecret
 *.bak2-*
 *.bak3-*
 _patch_*.py
+
+# 运行日志
+data/server.out
+data/server.err
