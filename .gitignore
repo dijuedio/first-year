@@ -8,3 +8,12 @@ data/users.db
 data/users.db-wal
 data/users.db-shm
 _patch_auth_server.py
+
+# 本地运行时产物与补丁脚本，不进仓库
+data/test_users_*
+data/*.log
+data/.keysecret
+*.bak-*
+*.bak2-*
+*.bak3-*
+_patch_*.py

@@ -64,7 +64,10 @@ async function api(path, body, method) {
 }
 function applyUser(u) {
   saveProfile({ name: u.nickname || u.username, av: u.avatar | 0, img: u.avatar_img || '' });
-  S.user = { username: u.username, nickname: u.nickname, id: u.id };
+  S.user = {
+    username: u.username, nickname: u.nickname, id: u.id,
+    role: u.role || 'user', has_key: !!u.has_key, key_hint: u.key_hint || '',
+  };
 }
 async function pushProfile() {
   if (!authToken()) return;
@@ -325,6 +328,38 @@ function bind() {
   document.querySelectorAll('[data-edit]').forEach((b) => {
     b.onclick = () => { S.edit = (b.dataset.edit === 'close') ? '' : b.dataset.edit; render(); };
   });
+  document.querySelectorAll('[data-key]').forEach((b) => {
+    b.onclick = async () => {
+      if (b.dataset.key === 'edit') { S.edit = 'key'; render(); return; }
+      if (b.dataset.key === 'clear') {
+        if (!confirm('清掉现在这把 key？清掉后就没有 AI 台词了。')) return;
+        const r = await api('/api/key', { action: 'clear' });
+        if (r.ok && r.data.user) applyUser(r.data.user);
+        S.edit = '';
+        render();
+      }
+    };
+  });
+  document.querySelectorAll('[data-save-key]').forEach((b) => {
+    b.onclick = async () => {
+      const msg = (t) => { const m = document.querySelector('#meKeyMsg'); if (m) m.textContent = t; };
+      const key = ((document.querySelector('#meKey') || {}).value || '').trim();
+      const base = ((document.querySelector('#meBase') || {}).value || '').trim();
+      const model = ((document.querySelector('#meModel') || {}).value || '').trim();
+      if (!key) return msg('key 不能空着');
+      msg('正在验证…');
+      b.disabled = true;
+      const r = await api('/api/key', { api_key: key, api_base: base, api_model: model });
+      b.disabled = false;
+      if (!r.ok) return msg(r.data.error || '存不上，再试一次');
+      if (r.data.user) applyUser(r.data.user);
+      S.edit = '';
+      render();
+    };
+  });
+  document.querySelectorAll('[data-admin]').forEach((b) => {
+    b.onclick = () => { location.href = '/admin'; };
+  });
   document.querySelectorAll('[data-logout]').forEach((b) => {
     b.onclick = async () => {
       await api('/api/logout', {}, 'POST');
@@ -412,7 +447,12 @@ function authScreen(mode) {
              placeholder="用户名（3 到 20 个字）" value="${esc(S.authName || '')}">
       <input id="auPass" class="lgin" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}"
              placeholder="密码（至少 6 位）">
-      ${reg ? `<input id="auPass2" class="lgin" type="password" autocomplete="new-password" placeholder="再输一次密码">` : ''}
+      ${reg ? `<input id="auPass2" class="lgin" type="password" autocomplete="new-password" placeholder="再输一次密码">
+      <input id="auKey" class="lgin" autocomplete="off" spellcheck="false"
+             placeholder="你的 API Key（sk-…，只存在服务器上）">
+      <div style="font-size:11px;line-height:1.5;color:#6b7a85;padding:0 4px 6px">
+        每个人用自己的模型额度，填了才有 AI 台词；不填也能注册，游戏里只会看到固定的兜底台词。
+      </div>` : ''}
       <div class="authMsg" id="auMsg"></div>
       <button class="rep go" data-submit="1" style="width:100%;margin-top:4px;padding:12px 0">${reg ? '注册并进入' : '登录'}</button>
     </div>
@@ -462,7 +502,9 @@ async function submitAuth() {
   if (!username || password.length < 6) return tip('用户名要填，密码至少 6 位');
   if (reg && again !== password) return tip('两次输入不一样');
   tip(reg ? '正在注册…' : '正在登录…');
-  const r = await api(reg ? '/api/register' : '/api/login', { username, password });
+  const myKey = reg ? ((document.querySelector('#auKey') || {}).value || '').trim() : '';
+  const r = await api(reg ? '/api/register' : '/api/login',
+    reg ? { username, password, api_key: myKey } : { username, password });
   if (!r.ok) return tip(r.data.error || '出了点问题，再试一次');
   setAuthToken(r.data.token);
   applyUser(r.data.user);
@@ -610,6 +652,22 @@ function viewMe() {
       <div class="card">
         <div class="row"><span class="k">记下来的话</span><span class="v">${S.kept} 句</span></div>
         <div class="row"><span class="k">走过的天</span><span class="v">${S.day} / 90</span></div>
+      </div>
+      <div class="card">
+        <button class="rowbtn" data-key="edit"><span class="k">我的 API Key</span><span class="v">${(S.user && S.user.has_key) ? esc(S.user.key_hint) + ' ›' : '还没填 ›'}</span></button>
+        ${S.edit === 'key' ? `
+        <div style="margin-top:10px">
+          <input id="meKey" class="lgin" autocomplete="off" spellcheck="false" placeholder="sk-…（换一个就覆盖）">
+          <input id="meBase" class="lgin" autocomplete="off" placeholder="接口地址（留空=DeepSeek 官方）">
+          <input id="meModel" class="lgin" autocomplete="off" placeholder="模型名（留空=deepseek-chat）">
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="rep go" data-save-key="1">保存并验证</button>
+            <button class="rep" data-key="clear">清掉</button>
+            <button class="rep" data-edit="close">算了</button>
+          </div>
+          <div class="authMsg" id="meKeyMsg"></div>
+        </div>` : ''}
+        ${(S.user && S.user.role === 'admin') ? '<button class="rowbtn" data-admin="1"><span class="k">后台</span><span class="v">玩家、用量、测试 ›</span></button>' : ''}
       </div>
       <div class="card">
         <button class="rowbtn" data-edit="name"><span class="k">名字</span><span class="v">${esc(meName())} ›</span></button>

@@ -40,6 +40,11 @@ load_env_file()
 API_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/chat/completions")
 API_KEY = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
+DEFAULT_BASE = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/chat/completions")
+# 管理员账号：启动时按 .env 的 ADMIN_USER / ADMIN_PASSWORD 建或补全。
+# 旧的共享 key（DEEPSEEK_API_KEY）只挂在这个管理员名下，普通账号必须自带 key。
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -118,8 +123,8 @@ def build_judge_messages(ev, text):
     ]
 
 
-def judge_action(ev, text):
-    raw = call_llm(build_judge_messages(ev, text), timeout=12)
+def judge_action(ev, text, user=None):
+    raw = call_llm(build_judge_messages(ev, text), timeout=12, user=user)
     if not raw:
         return None
     m = re.search(r"-1|[0-9]+", raw)
@@ -153,11 +158,13 @@ def build_messages(ev, beat_index, player_text, history, state):
     return msgs
 
 
-def call_llm(messages, timeout=20):
-    if not API_KEY:
+def call_llm(messages, timeout=20, user=None):
+    """用这个账号自己的 key 调模型；没有 key 就返回 None（上层自动走兜底台词）。"""
+    key, url, model = llm_settings(user)
+    if not key:
         return None
     body = json.dumps({
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 1.15,
         "top_p": 0.95,
@@ -166,15 +173,19 @@ def call_llm(messages, timeout=20):
         "max_tokens": 200,
     }).encode("utf-8")
     req = urllib.request.Request(
-        API_URL,
+        url,
         data=body,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + API_KEY},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.loads(r.read().decode("utf-8"))
         text = payload["choices"][0]["message"]["content"]
+        if user is not None and "id" in user.keys():
+            with db_conn() as c:
+                c.execute("UPDATE users SET calls = calls + 1, last_call_at = ? WHERE id = ?",
+                          (int(time.time()), user["id"]))
         return clean(text)
     except Exception as e:  # 网络、额度、格式，全走兜底
         print("[llm] 调用失败，用兜底台词：", repr(e)[:160], file=sys.stderr)
@@ -285,16 +296,154 @@ ENDINGS = {
 
 # ---------------------------------------------------------------- 账号（SQLite，标准库）
 
+import base64
 import hashlib
+import hmac
 import secrets
 import sqlite3
 import time
 
-DB_PATH = os.path.join(DATA_DIR, "users.db")
+DB_PATH = os.environ.get("DB_PATH") or os.path.join(DATA_DIR, "users.db")   # 测试可用 DB_PATH 指到临时库
 PW_ITER = 120000          # PBKDF2 迭代次数
 SESSION_DAYS = 30
 NICK_MAX = 8
 IMG_MAX = 1200 * 1024     # 头像 dataURL 上限，约 900KB 原图
+
+
+def _load_key_secret():
+    """用户 API Key 的加密主密钥：优先 .env 的 KEY_SECRET，否则用 data/.keysecret（首次自动生成）。"""
+    env = (os.environ.get("KEY_SECRET") or "").strip()
+    if env:
+        return env.encode("utf-8")
+    path = os.path.join(DATA_DIR, ".keysecret")
+    try:
+        with open(path, "rb") as f:
+            data = f.read().strip()
+        if len(data) >= 32:
+            return data
+    except FileNotFoundError:
+        pass
+    data = secrets.token_hex(32).encode("ascii")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    return data
+
+
+KEY_SECRET = _load_key_secret()
+
+
+def _keystream(secret, nonce, n):
+    out = b""
+    i = 0
+    while len(out) < n:
+        out += hmac.new(secret, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest()
+        i += 1
+    return out[:n]
+
+
+def encrypt_key(plain):
+    """把用户的 key 加密成一串可入库的文本（HMAC-SHA256 计数器流 + 完整性校验）。"""
+    if not plain:
+        return ""
+    nonce = os.urandom(12)
+    data = plain.encode("utf-8")
+    ct = bytes(a ^ b for a, b in zip(data, _keystream(KEY_SECRET, nonce, len(data))))
+    tag = hmac.new(KEY_SECRET, nonce + ct, hashlib.sha256).digest()[:16]
+    return base64.b64encode(nonce + tag + ct).decode("ascii")
+
+
+def decrypt_key(blob):
+    if not blob:
+        return ""
+    try:
+        raw = base64.b64decode(blob)
+        nonce, tag, ct = raw[:12], raw[12:28], raw[28:]
+        want = hmac.new(KEY_SECRET, nonce + ct, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag, want):
+            return ""
+        return bytes(a ^ b for a, b in zip(ct, _keystream(KEY_SECRET, nonce, len(ct)))).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def verify_key(key, url=None, model=None, timeout=15):
+    """拿这个 key 真打一次最小请求。返回 (能不能用, 人话原因)。"""
+    url = url or DEFAULT_BASE
+    model = model or MODEL
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        if payload.get("choices"):
+            return True, "ok"
+        return False, "接口没返回内容"
+    except urllib.error.HTTPError as e:
+        code = e.code
+        plain = {"401": "key 不对", "402": "余额不足", "403": "没有权限",
+                 "404": "地址不对", "429": "被限流"}.get(str(code), "HTTP %d" % code)
+        try:
+            extra = e.read().decode("utf-8", "ignore")[:160]
+        except Exception:
+            extra = ""
+        return False, plain + ("：" + extra if extra else "")
+    except Exception as e:
+        return False, "连不上（%s）" % type(e).__name__
+
+
+def llm_settings(user):
+    """返回 (key, url, model)。用户自己的优先；管理员没填时回落到 .env 的那个。"""
+    if user is not None:
+        cols = user.keys()
+        enc = user["api_key_enc"] if "api_key_enc" in cols else ""
+        key = decrypt_key(enc) if enc else ""
+        if key:
+            base = (user["api_base"] if "api_base" in cols else "") or DEFAULT_BASE
+            model = (user["api_model"] if "api_model" in cols else "") or MODEL
+            return key, base, model
+        role = user["role"] if "role" in cols else "user"
+        if role == "admin" and API_KEY:
+            return API_KEY, DEFAULT_BASE, MODEL
+    return "", DEFAULT_BASE, MODEL
+
+
+def _add_cols(conn, table, cols):
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+    for name, ddl in cols:
+        if name not in have:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, ddl))
+
+
+def ensure_admin():
+    """建/补管理员账号，并把 .env 里的共享 key 收进它名下（普通账号不再偷偷用）。"""
+    if not ADMIN_PASSWORD:
+        return
+    now = int(time.time())
+    with db_conn() as c:
+        row = c.execute("SELECT * FROM users WHERE username = ?", (ADMIN_USER,)).fetchone()
+        if not row:
+            ph, salt = hash_password(ADMIN_PASSWORD)
+            enc = encrypt_key(API_KEY) if API_KEY else ""
+            c.execute(
+                "INSERT INTO users(username, pass_hash, salt, created_at, role, api_key_enc, key_status) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (ADMIN_USER, ph, salt, now, "admin", enc, "ok" if enc else ""))
+            print("[admin] 已创建管理员账号：" + ADMIN_USER)
+            return
+        if (row["role"] or "user") != "admin":
+            c.execute("UPDATE users SET role = 'admin' WHERE id = ?", (row["id"],))
+        if API_KEY and not (row["api_key_enc"] or ""):
+            c.execute("UPDATE users SET api_key_enc = ?, key_status = 'ok' WHERE id = ?",
+                      (encrypt_key(API_KEY), row["id"]))
+            print("[admin] 已把 .env 的 key 收到管理员名下")
 
 
 def db_conn():
@@ -325,6 +474,17 @@ def init_db():
                 expires_at  INTEGER NOT NULL
             )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        # 2026-10-28：账号自带的 API Key 与后台所需的字段（老库直接 ALTER 补上）
+        _add_cols(c, "users", [
+            ("role", "TEXT NOT NULL DEFAULT 'user'"),
+            ("api_key_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("api_base", "TEXT NOT NULL DEFAULT ''"),
+            ("api_model", "TEXT NOT NULL DEFAULT ''"),
+            ("key_status", "TEXT NOT NULL DEFAULT ''"),
+            ("calls", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_call_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("banned", "INTEGER NOT NULL DEFAULT 0"),
+        ])
 
 
 def hash_password(password, salt_hex=None):
@@ -339,6 +499,13 @@ def verify_password(password, salt_hex, expected):
 
 
 def public_user(row):
+    """给前端的用户信息。API Key 只回末四位掩码，明文永不出服务端。"""
+    cols = row.keys()
+
+    def g(name, default=""):
+        return row[name] if name in cols else default
+
+    plain = decrypt_key(g("api_key_enc", "") or "")
     return {
         "id": row["id"],
         "username": row["username"],
@@ -346,6 +513,11 @@ def public_user(row):
         "avatar": row["avatar"],
         "avatar_img": row["avatar_img"],
         "created_at": row["created_at"],
+        "role": g("role", "user") or "user",
+        "has_key": bool(plain),
+        "key_hint": ("****" + plain[-4:]) if len(plain) >= 8 else ("****" if plain else ""),
+        "key_status": g("key_status", "") or "",
+        "calls": g("calls", 0) or 0,
     }
 
 
@@ -383,6 +555,7 @@ def drop_session(token):
 
 
 init_db()
+ensure_admin()
 
 
 # ---------------------------------------------------------------- HTTP
@@ -408,15 +581,51 @@ class Handler(BaseHTTPRequestHandler):
             return auth[7:].strip()
         return ""
 
+    def _user(self):
+        return user_from_token(self._token())
+
+    def _admin(self):
+        row = self._user()
+        if not row or (row["role"] or "user") != "admin":
+            return None
+        return row
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/":
             return self._file(os.path.join(STATIC_DIR, "index.html"))
+        if path == "/admin":
+            return self._file(os.path.join(STATIC_DIR, "admin.html"))
         if path.startswith("/static/"):
             rel = path[len("/static/"):].replace("..", "")
             return self._file(os.path.join(STATIC_DIR, rel))
         if path == "/api/meta":
             return self._json({"meta": EVENTS["meta"], "events": EVENTS["events"], "story": STORY})
+        if path == "/api/admin/overview":
+            admin = self._admin()
+            if not admin:
+                return self._json({"error": "只有管理员能看"}, 403)
+            with db_conn() as c:
+                users = c.execute("SELECT * FROM users ORDER BY id").fetchall()
+            lst = []
+            for u in users:
+                d = public_user(u)
+                d["banned"] = int(u["banned"] or 0)
+                d["last_call_at"] = int(u["last_call_at"] or 0)
+                d["api_base"] = u["api_base"] or ""
+                d["api_model"] = u["api_model"] or ""
+                lst.append(d)
+            return self._json({
+                "total": len(lst),
+                "with_key": sum(1 for x in lst if x["has_key"]),
+                "admins": sum(1 for x in lst if x["role"] == "admin"),
+                "calls_total": sum(int(x["calls"] or 0) for x in lst),
+                "banned": sum(1 for x in lst if x["banned"]),
+                "server_key": bool(API_KEY),
+                "game_events": len(EVENTS.get("events") or []),
+                "users": lst,
+            })
+
         if path == "/api/me":
             row = user_from_token(self._token())
             if not row:
@@ -455,14 +664,27 @@ class Handler(BaseHTTPRequestHandler):
                     if row:
                         return self._json({"error": "这个用户名已经有人用了"}, 409)
                     ph, salt = hash_password(password)
+                    # 用户自己的模型 key：填了就当场验一次，验不过不让注册（避免存一个坏 key）
+                    api_key = (payload.get("api_key") or "").strip()
+                    api_base = (payload.get("api_base") or "").strip()
+                    api_model = (payload.get("api_model") or "").strip()
+                    if api_key:
+                        ok, why = verify_key(api_key, api_base or DEFAULT_BASE, api_model or MODEL)
+                        if not ok:
+                            return self._json({"error": "这个 API Key 用不了：" + why}, 400)
+                    key_enc = encrypt_key(api_key) if api_key else ""
                     cur = conn.execute(
-                        "INSERT INTO users(username, pass_hash, salt, created_at) VALUES(?,?,?,?)",
-                        (username, ph, salt, int(time.time())))
+                        "INSERT INTO users(username, pass_hash, salt, created_at, role, api_key_enc, api_base, api_model, key_status) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (username, ph, salt, int(time.time()), "user", key_enc, api_base, api_model,
+                         "ok" if api_key else ""))
                     conn.commit()
                     uid = cur.lastrowid
                 else:
                     if not row or not verify_password(password, row["salt"], row["pass_hash"]):
                         return self._json({"error": "用户名或密码不对"}, 401)
+                    if int(row["banned"] or 0):
+                        return self._json({"error": "这个账号被管理员封了"}, 403)
                     uid = row["id"]
                 token = create_session(uid)
                 fresh = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
@@ -497,7 +719,95 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             return self._json({"user": public_user(fresh)})
 
+        if path == "/api/key":
+            row = self._user()
+            if not row:
+                return self._json({"error": "没有登录"}, 401)
+            action = (payload.get("action") or "set").strip()
+            if action == "clear":
+                with db_conn() as c:
+                    c.execute("UPDATE users SET api_key_enc = '', key_status = '' WHERE id = ?", (row["id"],))
+                return self._json({"ok": True, "user": public_user(self._user())})
+            new_key = (payload.get("api_key") or "").strip()
+            base = (payload.get("api_base") or "").strip()
+            model = (payload.get("api_model") or "").strip()
+            if not new_key:
+                return self._json({"error": "key 不能为空"}, 400)
+            ok, why = verify_key(new_key, base or DEFAULT_BASE, model or MODEL)
+            if not ok:
+                with db_conn() as c:
+                    c.execute("UPDATE users SET key_status = 'invalid' WHERE id = ?", (row["id"],))
+                return self._json({"error": "这个 key 用不了：" + why}, 400)
+            with db_conn() as c:
+                c.execute("UPDATE users SET api_key_enc = ?, api_base = ?, api_model = ?, key_status = 'ok' WHERE id = ?",
+                          (encrypt_key(new_key), base, model, row["id"]))
+            return self._json({"ok": True, "user": public_user(self._user())})
+
+        if path == "/api/admin/overview":
+            admin = self._admin()
+            if not admin:
+                return self._json({"error": "只有管理员能看"}, 403)
+            with db_conn() as c:
+                users = c.execute("SELECT * FROM users ORDER BY id").fetchall()
+            lst = []
+            for u in users:
+                d = public_user(u)
+                d["banned"] = int(u["banned"] or 0)
+                d["last_call_at"] = int(u["last_call_at"] or 0)
+                d["api_base"] = u["api_base"] or ""
+                d["api_model"] = u["api_model"] or ""
+                lst.append(d)
+            return self._json({
+                "total": len(lst),
+                "with_key": sum(1 for x in lst if x["has_key"]),
+                "admins": sum(1 for x in lst if x["role"] == "admin"),
+                "calls_total": sum(int(x["calls"] or 0) for x in lst),
+                "banned": sum(1 for x in lst if x["banned"]),
+                "server_key": bool(API_KEY),
+                "game_events": len(EVENTS.get("events") or []),
+                "users": lst,
+            })
+
+        if path == "/api/admin/act":
+            admin = self._admin()
+            if not admin:
+                return self._json({"error": "只有管理员能操作"}, 403)
+            uid = int(payload.get("user_id") or 0)
+            act = (payload.get("action") or "").strip()
+            if uid == admin["id"] and act in ("ban", "demote"):
+                return self._json({"error": "别把自己关掉"}, 400)
+            if act == "ban":
+                sql, args = "UPDATE users SET banned = 1 WHERE id = ?", (uid,)
+            elif act == "unban":
+                sql, args = "UPDATE users SET banned = 0 WHERE id = ?", (uid,)
+            elif act == "reset_key":
+                sql, args = "UPDATE users SET api_key_enc = '', key_status = '' WHERE id = ?", (uid,)
+            elif act == "set_role":
+                role = "admin" if (payload.get("role") or "") == "admin" else "user"
+                sql, args = "UPDATE users SET role = ? WHERE id = ?", (role, uid)
+            else:
+                return self._json({"error": "不认识这个操作"}, 400)
+            with db_conn() as c:
+                c.execute(sql, args)
+            return self._json({"ok": True})
+
+        if path == "/api/admin/test":
+            admin = self._admin()
+            if not admin:
+                return self._json({"error": "只有管理员能测"}, 403)
+            key, url, model = llm_settings(admin)
+            if not key:
+                return self._json({"error": "管理员名下还没有 key：在 .env 写 DEEPSEEK_API_KEY，或后台给管理员设一个"}, 400)
+            t0 = time.time()
+            reply = call_llm([{"role": "user", "content": "用一句话说你准备好了"}], timeout=25, user=admin)
+            ms = int((time.time() - t0) * 1000)
+            return self._json({"ok": bool(reply), "latency_ms": ms, "model": model,
+                               "url": url, "reply": reply or "（模型没返回，已走兜底台词）"})
+
         if path == "/api/talk":
+            user = self._user()
+            if user is not None and int(user["banned"] or 0):
+                return self._json({"error": "这个账号被管理员封了"}, 403)
             ev = EVENT_MAP.get(payload.get("event_id"))
             if not ev:
                 return self._json({"error": "unknown event"}, 400)
@@ -505,23 +815,29 @@ class Handler(BaseHTTPRequestHandler):
             state = payload.get("state") or {}
             text = call_llm(build_messages(
                 ev, beat, payload.get("text", ""), payload.get("history", []), state
-            ))
+            ), user=user)
             if not text:
                 return self._json({"reply": fallback_line(ev, beat, payload.get("history")), "fallback": True})
             return self._json({"reply": text, "fallback": False})
 
         if path == "/api/judge":
+            user = self._user()
+            if user is not None and int(user["banned"] or 0):
+                return self._json({"error": "这个账号被管理员封了"}, 403)
             ev = EVENT_MAP.get(payload.get("event_id"))
             if not ev:
                 return self._json({"error": "unknown event"}, 400)
-            label = judge_action(ev, (payload.get("text") or "").strip())
+            label = judge_action(ev, (payload.get("text") or "").strip(), user=user)
             return self._json({"label": label, "matched": bool(label)})
 
         if path == "/api/open":
+            user = self._user()
+            if user is not None and int(user["banned"] or 0):
+                return self._json({"error": "这个账号被管理员封了"}, 403)
             ev = EVENT_MAP.get(payload.get("event_id"))
             if not ev:
                 return self._json({"error": "unknown event"}, 400)
-            text = call_llm(build_open_messages(ev, payload.get("state") or {}))
+            text = call_llm(build_open_messages(ev, payload.get("state") or {}), user=user)
             if not text:
                 return self._json({"reply": ev["opening"], "fallback": True})
             return self._json({"reply": text, "fallback": False})
@@ -562,6 +878,7 @@ def main():
     print("  《第一年》已启动")
     print(f"  打开：http://127.0.0.1:{port}")
     print(f"  模型：{MODEL}   key：{has_key}")
+    print("  账号：每个玩家用自己的 API Key；管理员后台 http://127.0.0.1:%d/admin" % port)
     print("  Ctrl+C 结束")
     print("=" * 46)
     ThreadingHTTPServer.allow_reuse_address = False   # Windows 上允许复用会导致两个实例同时监听

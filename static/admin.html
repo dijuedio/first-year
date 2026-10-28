@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第一年 · 后台</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#262b35; --txt:#e8ecf3; --dim:#8b95a7; --hi:#6ea8fe; --bad:#ff6b6b; --good:#4ade80; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.6 -apple-system,"Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .sp { flex:1; }
+  a, button { font:inherit; }
+  .btn { background:#222836; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  .btn:hover { border-color:var(--hi); }
+  .btn.hi { background:var(--hi); color:#0b1020; border-color:var(--hi); font-weight:600; }
+  .btn.warn { border-color:#5a2a2a; color:#ffb3b3; }
+  .wrap { padding:18px 20px 60px; max-width:1100px; margin:0 auto; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card .k { color:var(--dim); font-size:12px; }
+  .card .v { font-size:22px; font-weight:600; margin-top:4px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:16px; }
+  .panel h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; font-size:12px; }
+  tr:hover td { background:#1c2028; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .tag.admin { color:#ffd479; border-color:#5a4a1f; }
+  .tag.banned { color:var(--bad); border-color:#5a2a2a; }
+  .tag.ok { color:var(--good); border-color:#22513a; }
+  .tag.none { color:var(--dim); }
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+  .muted { color:var(--dim); }
+  .err { color:var(--bad); }
+  .testout { margin-top:10px; padding:10px 12px; background:#12151b; border:1px dashed var(--line); border-radius:8px; white-space:pre-wrap; word-break:break-all; }
+  .center { text-align:center; padding:60px 20px; color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>《第一年》· 后台</h1>
+  <span class="muted" id="who"></span>
+  <span class="sp"></span>
+  <button class="btn" id="refresh">刷新</button>
+  <a class="btn" href="/">回游戏</a>
+</header>
+
+<div class="wrap" id="app">
+  <div class="center">正在读数据…</div>
+</div>
+
+<script>
+const TOKEN_KEY = 'firstyear.token';
+const token = () => { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } };
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const when = (ts) => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : '—';
+
+async function api(path, body) {
+  const t = token();
+  const opt = { headers: {} };
+  if (t) opt.headers['Authorization'] = 'Bearer ' + t;
+  if (body !== undefined) {
+    opt.method = 'POST';
+    opt.headers['Content-Type'] = 'application/json';
+    opt.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opt);
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  return { ok: r.ok, status: r.status, data: d };
+}
+
+function needLogin(msg) {
+  document.querySelector('#app').innerHTML =
+    '<div class="center">' + esc(msg) + '<br><br>' +
+    '<a class="btn hi" href="/">去登录</a></div>';
+}
+
+async function load() {
+  if (!token()) return needLogin('没登录。先在游戏里注册或登录，再回来这里。');
+  const r = await api('/api/admin/overview');
+  if (r.status === 401) return needLogin('登录过期了，回游戏重新登录。');
+  if (r.status === 403) return needLogin('这个账号不是管理员。要进后台，用管理员账号登录。');
+
+  const d = r.data;
+  document.querySelector('#who').textContent =
+    '共 ' + d.total + ' 个账号 · 总调用 ' + d.calls_total + ' 次' + (d.banned ? ' · 封禁 ' + d.banned : '');
+
+  const rows = d.users.map((u) => {
+    const role = u.role === 'admin' ? '<span class="tag admin">管理员</span>' : '<span class="tag">玩家</span>';
+    const key = u.has_key
+      ? '<span class="tag ok">已配</span> <span class="mono muted">' + esc(u.key_hint) + '</span>'
+      : '<span class="tag none">没填</span>';
+    const st = u.banned ? ' <span class="tag banned">已封</span>' : '';
+    const ops = [];
+    ops.push('<button class="btn" data-act="' + (u.banned ? 'unban' : 'ban') + '" data-id="' + u.id + '">' + (u.banned ? '解封' : '封禁') + '</button>');
+    if (u.has_key) ops.push('<button class="btn warn" data-act="reset_key" data-id="' + u.id + '">清 key</button>');
+    ops.push('<button class="btn" data-act="set_role" data-id="' + u.id + '" data-role="' + (u.role === 'admin' ? 'user' : 'admin') + '">' + (u.role === 'admin' ? '降为玩家' : '设为管理员') + '</button>');
+    return '<tr>' +
+      '<td class="mono muted">' + u.id + '</td>' +
+      '<td>' + esc(u.username) + st + '</td>' +
+      '<td>' + esc(u.nickname || '—') + '</td>' +
+      '<td>' + role + '</td>' +
+      '<td>' + key + '</td>' +
+      '<td>' + (u.calls || 0) + '</td>' +
+      '<td class="muted">' + when(u.last_call_at) + '</td>' +
+      '<td class="muted">' + when(u.created_at) + '</td>' +
+      '<td>' + ops.join(' ') + '</td>' +
+      '</tr>';
+  }).join('');
+
+  document.querySelector('#app').innerHTML = `
+    <div class="cards">
+      <div class="card"><div class="k">账号总数</div><div class="v">${d.total}</div></div>
+      <div class="card"><div class="k">自己有 key</div><div class="v">${d.with_key}</div></div>
+      <div class="card"><div class="k">管理员</div><div class="v">${d.admins}</div></div>
+      <div class="card"><div class="k">累计调用</div><div class="v">${d.calls_total}</div></div>
+      <div class="card"><div class="k">封禁中</div><div class="v">${d.banned}</div></div>
+      <div class="card"><div class="k">服务器共享 key</div><div class="v">${d.server_key ? '有' : '无'}</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>模型连通性测试（用管理员自己的 key，不动玩家额度）</h2>
+      <button class="btn hi" id="btnTest">测一次</button>
+      <span class="muted" style="margin-left:10px">发一句最短的话，看模型能不能回来</span>
+      <div class="testout" id="testOut" style="display:none"></div>
+    </div>
+
+    <div class="panel">
+      <h2>玩家账号</h2>
+      <div style="overflow:auto">
+        <table>
+          <thead><tr><th>ID</th><th>账号</th><th>昵称</th><th>角色</th><th>Key</th><th>调用</th><th>最近调用</th><th>注册时间</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="9" class="muted">还没有账号</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  document.querySelector('#btnTest').onclick = async () => {
+    const out = document.querySelector('#testOut');
+    out.style.display = 'block';
+    out.textContent = '正在请求…';
+    const t = await api('/api/admin/test', {});
+    if (!t.ok) { out.innerHTML = '<span class="err">' + esc(t.data.error || ('HTTP ' + t.status)) + '</span>'; return; }
+    out.textContent = (t.data.ok ? '成功' : '失败（已走兜底）')
+      + ' · ' + t.data.latency_ms + 'ms · ' + t.data.model + '\n'
+      + '回复：' + t.data.reply + '\n接口：' + t.data.url;
+  };
+
+  document.querySelectorAll('[data-act]').forEach((b) => {
+    b.onclick = async () => {
+      const act = b.dataset.act;
+      const body = { user_id: Number(b.dataset.id), action: act };
+      if (act === 'set_role') body.role = b.dataset.role;
+      const label = { ban: '封禁', unban: '解封', reset_key: '清掉 key', set_role: '改角色' }[act] || act;
+      if (!confirm('确定要' + label + '这个账号吗？')) return;
+      b.disabled = true;
+      const r = await api('/api/admin/act', body);
+      if (!r.ok) { alert(r.data.error || ('HTTP ' + r.status)); b.disabled = false; return; }
+      load();
+    };
+  });
+}
+
+document.querySelector('#refresh').onclick = load;
+load();
+</script>
+</body>
+</html>
