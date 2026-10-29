@@ -2,6 +2,7 @@
 """真机冒烟：用真库真 key 起一次服务，验登录、后台、管理员测试接口、无 key 用户的兜底。
 跑完停服务并删掉临时测试账号。
 """
+import io
 import json
 import os
 import random
@@ -15,6 +16,21 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORT = 8021
+
+
+def _env_password():
+    """管理员密码只从 .env 读，别写死在代码里（以前写死过，进了 git 历史）。"""
+    p = os.path.join(ROOT, ".env")
+    try:
+        for line in io.open(p, encoding="utf-8"):
+            if line.strip().startswith("ADMIN_PASSWORD="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.environ.get("ADMIN_PASSWORD") or ""
+
+
+ADMIN_PASS = _env_password()
 BASE = "http://127.0.0.1:%d" % PORT
 ok, fail = 0, []
 
@@ -82,15 +98,18 @@ try:
     st, d = call("/admin")
     chk("/admin 200", st == 200, st)
 
-    st, d = call("/api/login", {"username": "admin", "password": "firstyear2026"})
-    chk("管理员登录", st == 200 and d.get("user", {}).get("role") == "admin", d.get("error"))
-    atok = d.get("token")
-    chk("管理员继承了 .env 的 key", d.get("user", {}).get("has_key") is True)
-
-    st, d = call("/api/admin/test", {}, token=atok)
-    chk("测试接口 200", st == 200, d)
-    chk("真模型调通", d.get("ok") is True, d.get("reply"))
-    print("     ↳ 耗时 %sms，模型 %s，回复：%s" % (d.get("latency_ms"), d.get("model"), str(d.get("reply"))[:40]))
+    if not ADMIN_PASS:
+        print("  ! .env 里没读到 ADMIN_PASSWORD，登录相关检查跳过")
+    else:
+        st, d = call("/api/login", {"username": "admin", "password": ADMIN_PASS})
+        chk("管理员登录", st == 200 and d.get("user", {}).get("role") == "admin", d.get("error"))
+        atok = d.get("token")
+        chk("管理员继承了 .env 的 key", d.get("user", {}).get("has_key") is True)
+        st, d = call("/api/admin/test", {}, token=atok)
+        chk("测试接口 200", st == 200, d)
+        chk("真模型调通", d.get("ok") is True, d.get("reply"))
+        print("     ↳ 耗时 %sms，模型 %s，回复：%s" % (
+            d.get("latency_ms"), d.get("model"), str(d.get("reply"))[:40]))
 
     st, d = call("/api/register", {"username": tmp_user, "password": "hello123"})
     chk("注册无 key 用户", st == 201, d.get("error"))
@@ -102,7 +121,8 @@ try:
 
     st, d = call("/api/talk", {"event_id": eid, "beat": 0, "text": "你好，我来看房",
                                "history": [], "state": {}}, token=utok)
-    chk("无 key 用户走兜底", st == 200 and d.get("fallback") is True, d)
+    chk("无 key 用户也能说话（借服务器额度）",
+        st == 200 and d.get("fallback") is False and bool(d.get("reply")), d)
 
 finally:
     proc.terminate()

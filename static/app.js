@@ -20,7 +20,8 @@ const S = {
   msgs: {}, unread: {}, calls: [], sms: [], notes: [], ledger: [], log: [],
   view: 'home', chatWith: null, filter: '全部', tab: 'wx', seq: 0, toast: null,
   profile: null, edit: '', draft: '', login: null,
-  user: null, authMode: 'login', authName: '', authMsg: ''
+  user: null, authMode: 'login', authName: '', authMsg: '',
+  saved: null, saveT: null
 };
 
 const groups = () => (S.story ? S.story.groups : ['家人']);
@@ -67,13 +68,19 @@ function applyUser(u) {
   S.user = {
     username: u.username, nickname: u.nickname, id: u.id,
     role: u.role || 'user', has_key: !!u.has_key, key_hint: u.key_hint || '',
+    public_left: u.public_left | 0,
   };
 }
 async function pushProfile() {
   if (!authToken()) return;
   const p = S.profile || { name: '', av: 0, img: '' };
   const r = await api('/api/profile', { nickname: p.name, avatar: p.av | 0, avatar_img: p.img || '' });
-  if (r.ok && r.data.user) S.user = { username: r.data.user.username, nickname: r.data.user.nickname, id: r.data.user.id };
+  if (r.ok && r.data.user) {
+    const u = r.data.user;
+    S.user = { username: u.username, nickname: u.nickname, id: u.id,
+      role: u.role || 'user', has_key: !!u.has_key, key_hint: u.key_hint || '',
+      public_left: u.public_left | 0 };
+  }
 }
 
 function loadProfile() {
@@ -129,7 +136,7 @@ async function boot() {
     const r = await api('/api/me');
     if (r.ok && r.data.user) {
       applyUser(r.data.user);
-      if (r.data.user.nickname) return splash();
+      if (r.data.user.nickname) return enterGame();
       return profileScreen();
     }
     setAuthToken('');
@@ -149,7 +156,7 @@ function startGame() {
     view: 'home', chatWith: null, filter: '全部', tab: 'wx', seq: 0, toast: null, hint: true
   });
   render();
-  setTimeout(nextStep, 900);
+  setTimeout(nextStep, 900);   // 新局的第一步会自动覆盖旧档
 }
 
 /* ------------------------------------------------ 渲染骨架 */
@@ -235,6 +242,7 @@ function bind() {
       S.kept++;
       S.blackout = Math.min(100, S.blackout + 8);
       push(S.contact, 'sys', '〔你把这句记在心里了〕');
+      saveSoon();
       render();
     };
   });
@@ -311,7 +319,7 @@ function bind() {
       saveProfile({ name: nm.slice(0, 8), av: p.av | 0, img: p.img || '' });
       S.login = null;
       await pushProfile();
-      splash();
+      await enterGame();
     };
   });
   document.querySelectorAll('[data-save-name]').forEach((b) => {
@@ -392,8 +400,24 @@ function bind() {
   document.querySelectorAll('[data-reject]').forEach((b) => {
     b.onclick = () => rejectCall();
   });
+  document.querySelectorAll('[data-resume]').forEach((b) => {
+    b.onclick = () => resumeGame();
+  });
+  document.querySelectorAll('[data-restart]').forEach((b) => {
+    b.onclick = async () => {
+      if (!window.confirm('这一局的进度会清掉，从头再来？')) return;
+      await api('/api/save/reset', {}, 'POST');
+      S.saved = null;
+      startGame();
+    };
+  });
   document.querySelectorAll('[data-again]').forEach((b) => {
-    b.onclick = () => { document.querySelector('.endmask')?.remove(); startGame(); };
+    b.onclick = async () => {
+      document.querySelector('.endmask')?.remove();
+      await api('/api/save/reset', {}, 'POST');
+      S.saved = null;
+      startGame();
+    };
   });
 }
 
@@ -510,7 +534,7 @@ async function submitAuth() {
   applyUser(r.data.user);
   S.authMsg = '';
   S.authName = '';
-  if (r.data.user.nickname) return splash();
+  if (r.data.user.nickname) return enterGame();
   return profileScreen();
 }
 
@@ -526,7 +550,10 @@ function splash() {
       ${meAvatar(30)}
       <span style="font-size:13px;color:#9fb3bd">以「${esc(meName())}」的身份</span>
     </div>
-    <button class="rep go" data-start="1" style="margin-top:20px;padding:11px 30px">开始</button>
+    ${S.saved && S.saved.data
+      ? `<button class="rep go" data-resume="1" style="margin-top:20px;padding:11px 30px">继续 · 第 ${S.saved.data.day || 1} 天</button>
+    <p style="font-size:11px;color:#5f707a;margin-top:14px"><span data-restart="1" style="cursor:pointer;text-decoration:underline">从头再来</span></p>`
+      : `<button class="rep go" data-start="1" style="margin-top:20px;padding:11px 30px">开始</button>`}
     <p style="font-size:11px;color:#5f707a;margin-top:30px">人物与事件均为虚构</p>
     <p style="font-size:11px;color:#4a5a63;margin-top:14px"><span data-logout="1" style="cursor:pointer;text-decoration:underline">换个身份</span></p>
   </div>`;
@@ -725,12 +752,24 @@ function viewChat() {
     </div>
     <div class="msgs">${bubbles || '<div class="empty">还没有消息</div>'}</div>
     ${replies}
-    <div class="inputbar">
-      <input id="typin" class="realin" autocomplete="off" value="${esc(S.draft || '')}"
-             placeholder="${replies ? '点上面的句子，或者自己打字' : '自己打字也可以'}">
-      <button class="sendbtn" data-send="1">发送</button>
-    </div>
+    ${inputBarHtml(c)}
   </div>`;
+}
+
+function inputBarHtml(c) {
+  const mine = S.ev && S.contact === c.id;
+  if (mine && !S.busy && S.replyStage === 'act') {
+    return `<div class="inputbar">
+      <input id="typin" class="realin" autocomplete="off" value="${esc(S.draft || '')}"
+             placeholder="点上面的句子，或者自己打字">
+      <button class="sendbtn" data-send="1">发送</button>
+    </div>`;
+  }
+  let hint = '现在不是这一场';
+  if (mine && S.replyStage === 'settle') hint = '这一场聊完了';
+  else if (mine && S.busy) hint = '对方正在打字……';
+  else if (mine) hint = '等对方先开口';
+  return `<div style="padding:16px 18px;text-align:center;color:#8a8f98;font-size:13px">${hint}</div>`;
 }
 
 function openChat(id) {
@@ -813,7 +852,10 @@ function viewSettings() {
     <div class="card">
       <div class="row"><span class="k">这一局</span><span class="v">第 ${S.day} 天</span></div>
       <div class="row"><span class="k">踩过的坑</span><span class="v">${S.log.filter((x) => x.result === 'pit').length} 次</span></div>
-      <div class="row"><span class="k">版本</span><span class="v">手机界面版 v2</span></div>
+      ${S.user && !S.user.has_key ? `<div class="row"><span class="k">今天的说话额度</span><span class="v">${S.user.public_left | 0} 句</span></div>` : ''}
+      <div class="row"><span class="k">存档</span><span class="v">每步自动存到账号</span></div>
+      <div class="row"><span class="k">重开这一局</span><span class="v"><span data-restart="1" style="cursor:pointer;text-decoration:underline;color:#c25a4a">清档重来</span></span></div>
+      <div class="row"><span class="k">版本</span><span class="v">手机界面版 v3</span></div>
     </div>
     <div class="card">
       <div class="muted">人物和事件是虚构的。真遇到事，打 12315、12345，或找当地住建部门、劳动监察。</div>
@@ -824,7 +866,79 @@ function viewSettings() {
 /* ------------------------------------------------ 剧情推进 */
 function push(cid, who, text, extra) {
   if (!S.msgs[cid]) S.msgs[cid] = [];
-  S.msgs[cid].push({ who, text, seq: S.seq++, ...(extra || {}) });
+  // 每条消息记下它属于哪一场（ev），取历史时按场次筛，避免同一个人多场戏串味
+  S.msgs[cid].push({ who, text, seq: S.seq++, ev: S.ev ? S.ev.id : null, ...(extra || {}) });
+}
+
+/* ------------------------------------------------ 存档 */
+
+function packSave() {
+  const msgs = {};
+  Object.keys(S.msgs || {}).forEach((k) => {
+    const arr = (S.msgs[k] || []).filter((m) => m.who !== 'typing');
+    if (arr.length) msgs[k] = arr;
+  });
+  return {
+    v: 1,
+    idx: S.idx, beat: S.beat, day: S.day, time: S.time, over: !!S.over,
+    money: S.money, trust: S.trust, alert: S.alert, blackout: S.blackout, kept: S.kept,
+    flags: S.flags || [], msgs, unread: S.unread || {}, calls: S.calls || [],
+    sms: S.sms || [], notes: S.notes || [], ledger: S.ledger || [], log: S.log || [],
+    seq: S.seq || 0, replyStage: S.replyStage || '', lastResult: S.lastResult || '',
+    tab: S.tab || 'wx', filter: S.filter || '全部'
+  };
+}
+
+function unpackSave(d, steps, map) {
+  const step = steps && steps[d.idx | 0];
+  return {
+    idx: d.idx | 0, beat: d.beat | 0, day: d.day || 1, time: d.time || '06:40',
+    over: !!d.over, money: d.money | 0, trust: d.trust | 0, alert: d.alert | 0,
+    blackout: d.blackout | 0, kept: d.kept | 0,
+    flags: Array.isArray(d.flags) ? d.flags : [],
+    msgs: d.msgs || {}, unread: d.unread || {}, calls: d.calls || [],
+    sms: d.sms || [], notes: d.notes || [], ledger: d.ledger || [], log: d.log || [],
+    seq: d.seq | 0, replyStage: d.replyStage || '', lastResult: d.lastResult || '',
+    tab: d.tab || 'wx', filter: d.filter || '全部',
+    ev: step ? map[step.event] : null,
+    contact: step ? step.contact : null,
+    chatWith: step ? step.contact : null,
+    busy: false, toast: null, draft: '', hint: true, saved: null
+  };
+}
+
+function saveSoon() {
+  if (!authToken()) return;
+  clearTimeout(S.saveT);
+  S.saveT = setTimeout(saveNow, 300);
+}
+
+async function saveNow() {
+  if (!authToken()) return;
+  const r = await api('/api/save', { data: packSave() });
+  if (!r.ok) console.warn('[save] 没存上', r.status, r.data && r.data.error);
+}
+
+async function enterGame() {
+  S.saved = null;
+  const r = await api('/api/save');
+  if (r.ok && r.data && r.data.save) S.saved = r.data.save;
+  splash();
+}
+
+function resumeGame() {
+  const d = S.saved && S.saved.data;
+  if (!d) return startGame();
+  Object.assign(S, unpackSave(d, S.steps, S.map));
+  if (S.over) { finish(); return; }          // 已经过完一年：直接把结局调回来
+  if (!S.ev) {
+    S.view = 'home';
+    render();
+    return;
+  }
+  S.view = 'home';
+  S.toast = { cid: S.contact, text: '上次说到这儿了' };
+  render();
 }
 
 function lastEventFor(cid) {
@@ -872,6 +986,7 @@ async function nextStep() {
   } else {
     await deliverOpening(step, ev);
   }
+  saveSoon();
 }
 
 function pickBridge(step) {
@@ -969,7 +1084,8 @@ async function answerCall() {
   S.unread[c.id] = 0;
   S.view = 'chat';
   render();
-  await deliverOpening(S.steps[S.idx], S.map[S.steps[S.idx].event]);
+  const _st = S.steps[S.idx];
+  if (_st && _st.contact === c.id) await deliverOpening(_st, S.map[_st.event]);
 }
 
 async function rejectCall() {
@@ -995,6 +1111,8 @@ function sendTyped() {
 
 async function choose(label, typed) {
   if (S.busy) return;
+  // 串台闸：只有这一场对应的那个联系人窗口，才能推进这一场
+  if (!S.ev || !S.contact || S.chatWith !== S.contact) return;
   S.busy = true;
   S.replyStage = '';
   push(S.chatWith, 'me', label, { fresh: true });
@@ -1002,7 +1120,7 @@ async function choose(label, typed) {
   render();
 
   const hist = (S.msgs[S.chatWith] || [])
-    .filter((m) => m.who === 'me' || m.who === 'them')
+    .filter((m) => (m.who === 'me' || m.who === 'them') && m.ev === S.ev.id)
     .map((m) => ({ who: m.who === 'me' ? 'player' : 'them', text: m.text }))
     .slice(-8);
 
@@ -1015,6 +1133,7 @@ async function choose(label, typed) {
     });
     const d = await r.json();
     reply = d.reply || '……';
+    if (d.public_left != null && S.user) S.user.public_left = d.public_left;
   } catch (e) { /* 走兜底 */ }
 
   await sleep(560);
@@ -1028,6 +1147,7 @@ async function choose(label, typed) {
 
   if (S.beat >= 5) return settle(label, typed);
   S.replyStage = 'act';
+  saveSoon();
   render();
   markRead();
 }
@@ -1080,8 +1200,10 @@ async function settle(label) {
     S.ledger.push({ label: `${S.ev.scene} · ${act}`, amount: S.money - before });
   }
   if (result === 'pit') {
-    push(S.contact, 'sys', '〔这句话你记住了〕', { kind: 'pit' });
-    updateNotes(S.ev.id, 'pit');
+    if (!S.ev.quiet) {                      // 第 15 场不说破，让玩家自己对上第 2 场
+      push(S.contact, 'sys', '〔这句话你记住了〕', { kind: 'pit' });
+      updateNotes(S.ev.id, 'pit');
+    }
     if (S.flags.includes('loan_signed')) addSms('分期平台', '您的租金分期已生效，共 24 期，每期 1,250 元，逾期将上报征信。');
     if (S.flags.includes('scammed_code')) addSms('银行', `您尾号 3847 的账户转出 ${Math.abs(S.money - before).toLocaleString('zh-CN')} 元，余额 ${S.money.toLocaleString('zh-CN')} 元。`);
   } else if (result === 'good') {
@@ -1090,6 +1212,7 @@ async function settle(label) {
   }
 
   S.replyStage = 'settle';
+  saveSoon();
   render();
 }
 
@@ -1114,6 +1237,7 @@ async function finish() {
   const lastMine = [...all].reverse().find((m) => m.who === 'me');
 
   S.over = true;
+  saveSoon();
   S.view = 'ending';
   S.time = '23:58';
   setStatus();

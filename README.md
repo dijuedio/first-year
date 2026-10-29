@@ -108,6 +108,8 @@ PORT=8010 python server.py
 | `LLM_BASE_URL` | `https://api.deepseek.com/chat/completions` | 换成别的兼容接口 |
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
 | `PORT` | `8000` | 端口 |
+| `PUBLIC_DAILY_CALLS` | `200` | 没填自己 key 的账号，每人每天能借用服务器 key 说几句 |
+| `PUBLIC_TOTAL_CALLS` | `2000` | 全站每天的上限，防止被人刷 |
 
 断网或者额度用完了，会自动切到兜底台词，页面上不报错，答辩可以现场拔网线演示。
 
@@ -138,10 +140,27 @@ python test_flow.py     # 按时间轴走完 15 步，看结局
 ├─ data/
 │  ├─ events.json      15 个事件，含节拍、坑、结算
 │  ├─ story.json       联系人 + 时间轴 + 短信/待办种子
-│  └─ fallback.json    兜底台词，一个事件五条
+│  ├─ demo.json        每场 4~6 句人物口气示范，只塞本场，给模型当参照
+│  └─ fallback.json    兜底台词，一个事件五条（按拍对应，第 5 条是收尾）
 ├─ static/             手机界面：index.html / style.css / app.js
 ├─ docs/技术文档.md     比赛要交的文档
 └─ 旧版/               上一版（命令行界面），留着对比，可以删
+```
+
+## 存档（2026-10-29）
+
+- 进度按账号存在 `data/users.db` 的 `saves` 表里，一个账号一份。
+- 每推进一步自动存（300ms 合并），登录后首页显示「继续 · 第 X 天」。
+- 换设备、清缓存、关浏览器，登同一个号都能接着玩。
+- 设置页有「重开这一局 · 清档重来」，会先弹确认。
+- 存档上限 2MB（玩完一整年只有几十 KB）。
+
+## 自测（新增）
+
+```bash
+python test_save.py     # 存档接口：多账号隔离、覆盖、清档、未登录、超大，13 项
+node _test_存档.mjs      # 存档打包/恢复往返，14 项
+node _test_串台.mjs      # 同一人跨场次不串、别人窗口打字不推进，3 个场景
 ```
 
 ## 一句话说明
@@ -151,8 +170,9 @@ python test_flow.py     # 按时间轴走完 15 步，看结局
 ## 模型 Key 与管理员后台（2026-10-28）
 
 - **每个账号用自己的 Key。** 注册页有一栏 `API Key`（sk-…）。服务端用 HMAC-SHA256 计数器流加密后存进
-  `data/users.db`，明文不出服务端，前端只显示末四位。不填也能注册，但对话只走 `data/fallback.json` 的固定台词，
-  不会调用模型。
+  `data/users.db`，明文不出服务端，前端只显示末四位。不填也能注册：会借用服务器 `.env` 里的 key，
+  每人每天 200 句（`PUBLIC_DAILY_CALLS`），用完才退回 `data/fallback.json` 的固定台词。
+  设置页能看到今天还剩多少句。
 - **注册时当场验 key。** 会拿它真打一次 `max_tokens=1` 的最小请求，验不过直接拒绝，避免库里躺着坏 key。
 - **管理员账号。** `.env` 的 `ADMIN_USER` / `ADMIN_PASSWORD` 指定；启动时自动创建或补全，并把原来的
   `DEEPSEEK_API_KEY` 收到管理员名下。管理员的"测一次"和后台都用这把 key，玩家额度互不影响。

@@ -67,6 +67,11 @@ EVENTS = load_json("events.json")
 FALLBACK = load_json("fallback.json")
 EVENT_MAP = {e["id"]: e for e in EVENTS["events"]}
 STORY = load_json("story.json")
+# 每场的人物口气示范（从人味版整理的），没有这个文件也能跑
+try:
+    DEMO = load_json("demo.json")
+except Exception:
+    DEMO = {}
 
 
 # ---------------------------------------------------------------- 提示词
@@ -88,10 +93,18 @@ def build_system(ev, beat_index, state, opening=False):
     else:
         beat = beats[beat_index] if beat_index < len(beats) else beats[-1]
     role = ROLE_HINT.get(ev["type"], ROLE_HINT["black"])
+    demo = DEMO.get(ev["id"]) or []
+    demo_block = ""
+    if demo:
+        _nl = "\n"
+        demo_block = ("这个人平常怎么说话（只学口气和用词，别照抄原句，也别提前把后面几轮的话说完）：" + _nl
+                      + _nl.join("「%s」" % d.replace(_nl, " ") for d in demo[:6]) + _nl + _nl)
+
     return (
         f"你在扮演微信（或电话）另一头的真人，不是助手。\n"
         f"你是谁：{ev['opponent']}，场景是「{ev['scene']}」。\n{role}\n"
         f"你的目的：{ev['goal']}。\n"
+        f"{demo_block}"
         f"现在轮到你说话，这一轮你想推进的是：{beat}（先把对方的话接住，再往前走）\n\n"
         f"规则：\n"
         f"1. 只说一到两句，像真人随手打字，每句不超过二十五个字。\n"
@@ -159,8 +172,9 @@ def build_messages(ev, beat_index, player_text, history, state):
     return msgs
 
 
-def call_llm(messages, timeout=20, user=None):
-    """用这个账号自己的 key 调模型；没有 key 就返回 None（上层自动走兜底台词）。"""
+def call_llm(messages, timeout=28, user=None, retries=1):
+    """用这个账号自己的 key 调模型；没有 key 就返回 None（上层自动走兜底台词）。
+    超时或网络抖动会重试一次——失败就掉进固定台词，那才是真的答非所问。"""
     key, url, model = llm_settings(user)
     if not key:
         return None
@@ -173,24 +187,30 @@ def call_llm(messages, timeout=20, user=None):
         "presence_penalty": 0.4,
         "max_tokens": 200,
     }).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = json.loads(r.read().decode("utf-8"))
-        text = payload["choices"][0]["message"]["content"]
-        if user is not None and "id" in user.keys():
-            with db_conn() as c:
-                c.execute("UPDATE users SET calls = calls + 1, last_call_at = ? WHERE id = ?",
-                          (int(time.time()), user["id"]))
-        return clean(text)
-    except Exception as e:  # 网络、额度、格式，全走兜底
-        print("[llm] 调用失败，用兜底台词：", repr(e)[:160], file=sys.stderr)
-        return None
+    last = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+            text = payload["choices"][0]["message"]["content"]
+            if user is not None and "id" in user.keys():
+                with db_conn() as c:
+                    c.execute("UPDATE users SET calls = calls + 1, last_call_at = ? WHERE id = ?",
+                              (int(time.time()), user["id"]))
+            return clean(text)
+        except Exception as e:  # 网络、额度、格式
+            last = e
+            if attempt < retries:
+                time.sleep(0.5)
+    print("[llm] 调用失败（已重试 %d 次），用兜底台词：%s" % (retries, repr(last)[:160]),
+          file=sys.stderr)
+    return None
 
 
 def clean(text):
@@ -203,12 +223,20 @@ def clean(text):
 
 
 def fallback_line(ev, beat_index, history=None):
+    """兜底台词：五个事件级台词按拍一一对应（第 1 条对开场，第 5 条对收尾）。
+    以前这里忽略 beat_index 随机抽，结果开场就蹦出「今天定，明天没这个价」。"""
     pool = ((FALLBACK.get("events") or {}).get(ev["id"])
             or (FALLBACK.get("types") or {}).get(ev["type"])
             or FALLBACK["types"]["black"])
     said = {(h.get("text") or "").strip() for h in (history or []) if h.get("who") != "player"}
-    fresh = [x for x in pool if x.strip() not in said]
-    pool = fresh or pool
+    if isinstance(pool, list) and pool:
+        idx = min(max(int(beat_index or 0), 0), len(pool) - 1)
+        if pool[idx].strip() not in said:
+            return pool[idx]
+        for x in pool[idx:] + pool[:idx]:
+            if x.strip() not in said:
+                return x
+        return pool[idx]
     return random.choice(pool)
 
 
@@ -413,6 +441,9 @@ def llm_settings(user):
         role = user["role"] if "role" in cols else "user"
         if role == "admin" and API_KEY:
             return API_KEY, DEFAULT_BASE, MODEL
+        # 自己没填 key：借用服务器的公共额度（按人按天限量）
+        if API_KEY and "id" in cols and public_quota_take(user["id"]):
+            return API_KEY, DEFAULT_BASE, MODEL
     return "", DEFAULT_BASE, MODEL
 
 
@@ -447,6 +478,51 @@ def ensure_admin():
             print("[admin] 已把 .env 的 key 收到管理员名下")
 
 
+# 2026-10-29：没填 key 的账号借用服务器 key 的上限。改了要重启。
+PUBLIC_DAILY_CALLS = int(os.environ.get("PUBLIC_DAILY_CALLS") or 200)   # 每人每天
+PUBLIC_TOTAL_CALLS = int(os.environ.get("PUBLIC_TOTAL_CALLS") or 2000)  # 全站每天
+
+
+def _today():
+    return time.strftime("%Y-%m-%d")
+
+
+def public_quota_take(uid):
+    """扣一次公共额度。扣到了返回 True。"""
+    day = _today()
+    conn = db_conn()
+    try:
+        row = conn.execute("SELECT day_key, day_calls FROM users WHERE id = ?", (uid,)).fetchone()
+        if not row:
+            return False
+        used = row["day_calls"] if row["day_key"] == day else 0
+        if used >= PUBLIC_DAILY_CALLS:
+            return False
+        g = conn.execute("SELECT calls FROM quota WHERE day = ?", (day,)).fetchone()
+        if g and g["calls"] >= PUBLIC_TOTAL_CALLS:
+            return False
+        conn.execute("UPDATE users SET day_key = ?, day_calls = ? WHERE id = ?", (day, used + 1, uid))
+        conn.execute(
+            "INSERT INTO quota(day, calls) VALUES(?, 1) "
+            "ON CONFLICT(day) DO UPDATE SET calls = calls + 1", (day,))
+        conn.execute("DELETE FROM quota WHERE day < ?", (day,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def public_quota_left(uid):
+    day = _today()
+    conn = db_conn()
+    try:
+        row = conn.execute("SELECT day_key, day_calls FROM users WHERE id = ?", (uid,)).fetchone()
+        used = row["day_calls"] if (row and row["day_key"] == day) else 0
+        return max(0, PUBLIC_DAILY_CALLS - used)
+    finally:
+        conn.close()
+
+
 def db_conn():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -475,6 +551,20 @@ def init_db():
                 expires_at  INTEGER NOT NULL
             )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        # 2026-10-29：账号存档。一个账号一份进度，换设备／清缓存都能接着玩。
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS quota(
+                day    TEXT PRIMARY KEY,
+                calls  INTEGER NOT NULL DEFAULT 0
+            )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS saves(
+                user_id    INTEGER NOT NULL,
+                slot       INTEGER NOT NULL DEFAULT 1,
+                data       TEXT NOT NULL,
+                saved_at   INTEGER NOT NULL,
+                PRIMARY KEY (user_id, slot)
+            )""")
         # 2026-10-28：账号自带的 API Key 与后台所需的字段（老库直接 ALTER 补上）
         _add_cols(c, "users", [
             ("role", "TEXT NOT NULL DEFAULT 'user'"),
@@ -485,6 +575,8 @@ def init_db():
             ("calls", "INTEGER NOT NULL DEFAULT 0"),
             ("last_call_at", "INTEGER NOT NULL DEFAULT 0"),
             ("banned", "INTEGER NOT NULL DEFAULT 0"),
+            ("day_key", "TEXT NOT NULL DEFAULT ''"),
+            ("day_calls", "INTEGER NOT NULL DEFAULT 0"),
         ])
 
 
@@ -519,6 +611,7 @@ def public_user(row):
         "key_hint": ("****" + plain[-4:]) if len(plain) >= 8 else ("****" if plain else ""),
         "key_status": g("key_status", "") or "",
         "calls": g("calls", 0) or 0,
+        "public_left": 0 if plain else public_quota_left(row["id"]),
     }
 
 
@@ -553,6 +646,49 @@ def drop_session(token):
         return
     with db_conn() as c:
         c.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+
+# ---------------------------------------------------------------- 存档
+
+SAVE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def save_get(user_id, slot=1):
+    """读这个账号的存档；没有就 None。"""
+    conn = db_conn()
+    try:
+        row = conn.execute(
+            "SELECT data, saved_at FROM saves WHERE user_id = ? AND slot = ?",
+            (user_id, slot)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        d = json.loads(row["data"])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    return {"data": d, "saved_at": row["saved_at"]}
+
+
+def save_put(user_id, data, slot=1):
+    """写存档。超上限返回 False，不落库。"""
+    raw = json.dumps(data, ensure_ascii=False)
+    if len(raw.encode("utf-8")) > SAVE_MAX_BYTES:
+        return False
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO saves(user_id, slot, data, saved_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id, slot) DO UPDATE SET data = excluded.data, saved_at = excluded.saved_at",
+            (user_id, slot, raw, int(time.time())))
+    return True
+
+
+def save_del(user_id, slot=1):
+    with db_conn() as c:
+        c.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
 
 
 init_db()
@@ -627,6 +763,12 @@ class Handler(BaseHTTPRequestHandler):
                 "users": lst,
             })
 
+        if path == "/api/save":
+            row = self._user()
+            if not row:
+                return self._json({"error": "没有登录"}, 401)
+            return self._json({"save": save_get(row["id"])})
+
         if path == "/api/me":
             row = user_from_token(self._token())
             if not row:
@@ -692,6 +834,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"token": token, "user": public_user(fresh)}, 201 if reg else 200)
             finally:
                 conn.close()
+
+        if path == "/api/save":
+            row = self._user()
+            if not row:
+                return self._json({"error": "没有登录"}, 401)
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return self._json({"error": "存档格式不对"}, 400)
+            if not save_put(row["id"], data):
+                return self._json({"error": "存档太大了"}, 413)
+            return self._json({"ok": True, "saved_at": int(time.time())})
+
+        if path == "/api/save/reset":
+            row = self._user()
+            if not row:
+                return self._json({"error": "没有登录"}, 401)
+            save_del(row["id"])
+            return self._json({"ok": True})
 
         if path == "/api/logout":
             drop_session(self._token())
@@ -817,9 +977,12 @@ class Handler(BaseHTTPRequestHandler):
             text = call_llm(build_messages(
                 ev, beat, payload.get("text", ""), payload.get("history", []), state
             ), user=user)
+            left = public_quota_left(user["id"]) if (
+                user is not None and not (user["api_key_enc"] or "")) else None
             if not text:
-                return self._json({"reply": fallback_line(ev, beat, payload.get("history")), "fallback": True})
-            return self._json({"reply": text, "fallback": False})
+                return self._json({"reply": fallback_line(ev, beat, payload.get("history")),
+                                   "fallback": True, "public_left": left})
+            return self._json({"reply": text, "fallback": False, "public_left": left})
 
         if path == "/api/judge":
             user = self._user()
