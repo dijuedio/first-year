@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-set PORT=8010
+set PORT=8000
 set PYEXE=
 
 rem 优先用 py 启动器，避免命中 Microsoft Store 的 python 占位程序
